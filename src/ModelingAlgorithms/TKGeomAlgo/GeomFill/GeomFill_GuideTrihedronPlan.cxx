@@ -28,6 +28,7 @@
 #include <gp_Vec.hxx>
 #include <IntCurveSurface_HInter.hxx>
 #include <IntCurveSurface_IntersectionPoint.hxx>
+#include <NCollection_Sequence.hxx>
 #include <math_FunctionRoot.hxx>
 #include <math_Matrix.hxx>
 #include <math_Vector.hxx>
@@ -35,6 +36,20 @@
 #include <Standard_Type.hxx>
 
 IMPLEMENT_STANDARD_RTTIEXT(GeomFill_GuideTrihedronPlan, GeomFill_TrihedronWithGuide)
+
+// cadrum fix A: the guide reaching this law is often a BRepAdaptor_CompCurve that has
+// lost the periodicity of its underlying closed curve (a closed wire is split into
+// unit-parameter edge spans). Detect closure geometrically so seam handling works for
+// both truly periodic adaptors and closed composite ones.
+static bool cadrumGuideClosed(const occ::handle<Adaptor3d_Curve>& theGuide, double& thePeriod)
+{
+  thePeriod = theGuide->LastParameter() - theGuide->FirstParameter();
+  if (theGuide->IsPeriodic())
+    return true;
+  const gp_Pnt aP1 = theGuide->Value(theGuide->FirstParameter());
+  const gp_Pnt aP2 = theGuide->Value(theGuide->LastParameter());
+  return aP1.Distance(aP2) < 1.e-4 * thePeriod;
+}
 
 // #include <gp_Trsf2d.hxx>
 // #include <Bnd_Box2d.hxx>
@@ -92,19 +107,10 @@ GeomFill_GuideTrihedronPlan::GeomFill_GuideTrihedronPlan(
 void GeomFill_GuideTrihedronPlan::Init()
 {
   myStatus = GeomFill_PipeOk;
-  gp_Pnt P;
-  //  Bnd_Box2d Box;
-  //  Box.Update(-0.1, -0.1, 0.1, 0.1); // Taille minimal
-  gp_Vec Tangent, Normal, BiNormal;
-  int    ii;
-  double t, DeltaG, w = 0.;
   double f = myCurve->FirstParameter();
   double l = myCurve->LastParameter();
+  double DeltaG;
 
-  occ::handle<Geom_Plane>           Plan;
-  occ::handle<GeomAdaptor_Surface>  Pl;
-  IntCurveSurface_IntersectionPoint PInt;
-  IntCurveSurface_HInter            Int;
   frenet->SetCurve(myCurve);
   DeltaG = (myGuide->LastParameter() - myGuide->FirstParameter()) / 2;
 
@@ -121,73 +127,116 @@ void GeomFill_GuideTrihedronPlan::Init()
   {
     myTrimG = myGuide;
   }
-  //  double Step = DeltaG/100;
   DeltaG /= 3;
-  for (ii = 1; ii <= myNbPts; ii++)
-  {
-    t = double(myNbPts - ii) * f + double(ii - 1) * l;
-    t /= (myNbPts - 1);
-    myCurve->D0(t, P);
-    frenet->D0(t, Tangent, Normal, BiNormal);
-    Plan = new (Geom_Plane)(P, Tangent);
-    Pl   = new (GeomAdaptor_Surface)(Plan);
 
-    Int.Perform(myTrimG, Pl); // intersection plan / guide
-    if (Int.NbPoints() == 0)
+  double     aGPeriod  = 0.;
+  const bool isGClosed = cadrumGuideClosed(myGuide, aGPeriod);
+
+  // cadrum fix C: one plane/guide solve at parameter theT. The branch is chosen by
+  // parameter continuity with thePrevW (spatially for the very first sample); a
+  // closed guide is cut twice by every normal plane and spatial selection can hop
+  // to the antipodal branch near the seam.
+  auto aSolveAt = [&](const double theT,
+                      const bool   theHasPrev,
+                      const double thePrevW,
+                      double&      theW) -> bool {
+    gp_Pnt aP;
+    gp_Vec aTg, aNm, aBn;
+    myCurve->D0(theT, aP);
+    frenet->D0(theT, aTg, aNm, aBn);
+    occ::handle<Geom_Plane>          aPlan = new (Geom_Plane)(aP, aTg);
+    occ::handle<GeomAdaptor_Surface> aPl   = new (GeomAdaptor_Surface)(aPlan);
+    IntCurveSurface_HInter           anInt;
+    anInt.Perform(myTrimG, aPl);
+    if (anInt.NbPoints() == 0)
+      return false;
+    bool   aFirst = true;
+    double aBest  = 0.;
+    if (!theHasPrev)
     {
-#ifdef OCCT_DEBUG
-      TracePlan(Plan);
-#endif
-      w = (fabs(myGuide->LastParameter() - w) > fabs(myGuide->FirstParameter() - w)
-             ? myGuide->FirstParameter()
-             : myGuide->LastParameter());
-
-      myStatus = GeomFill_PlaneNotIntersectGuide;
-      // return;
+      double aDmin = 0.;
+      for (int jj = 1; jj <= anInt.NbPoints(); jj++)
+      {
+        const double aD = aP.Distance(anInt.Point(jj).Pnt());
+        if (aFirst || aD < aDmin)
+        {
+          aDmin  = aD;
+          aBest  = anInt.Point(jj).W();
+          aFirst = false;
+        }
+      }
     }
     else
     {
-      gp_Pnt Pmin;
-      PInt        = Int.Point(1);
-      Pmin        = PInt.Pnt();
-      double Dmin = P.Distance(Pmin);
-      for (int jj = 2; jj <= Int.NbPoints(); jj++)
+      for (int jj = 1; jj <= anInt.NbPoints(); jj++)
       {
-        Pmin = Int.Point(jj).Pnt();
-        if (P.Distance(Pmin) < Dmin)
+        double aW = anInt.Point(jj).W();
+        if (isGClosed)
+          InGoodPeriod(thePrevW, aGPeriod, aW);
+        if (aFirst || std::abs(aW - thePrevW) < std::abs(aBest - thePrevW))
         {
-          PInt = Int.Point(jj);
-          Dmin = P.Distance(Pmin);
+          aBest  = aW;
+          aFirst = false;
         }
-      } // for_jj
-
-      w = PInt.W();
+      }
     }
-    if (ii > 1)
+    theW = aBest;
+    return true;
+  };
+
+  // Seed pass at myNbPts uniform samples.
+  NCollection_Sequence<gp_Pnt2d> aSeq;
+  bool   aHasPrev = false;
+  double aPrevW   = 0.;
+  for (int ii = 1; ii <= myNbPts; ii++)
+  {
+    double t = double(myNbPts - ii) * f + double(ii - 1) * l;
+    t /= (myNbPts - 1);
+    double aW = 0.;
+    if (aSolveAt(t, aHasPrev, aPrevW, aW))
     {
-      double Diff = w - Pole->Value(1, ii - 1).Y();
-      if (std::abs(Diff) > DeltaG)
-      {
-        if (myGuide->IsPeriodic())
-        {
-          InGoodPeriod(Pole->Value(1, ii - 1).Y(), myGuide->Period(), w);
-
-          Diff = w - Pole->Value(1, ii - 1).Y();
-        }
-      }
-
-#ifdef OCCT_DEBUG
-      if (std::abs(Diff) > DeltaG)
-      {
-        std::cout << "Trihedron Plan Diff on Guide : " << Diff << std::endl;
-      }
-#endif
+      aSeq.Append(gp_Pnt2d(t, aW));
+      aHasPrev = true;
+      aPrevW   = aW;
     }
+    else if (!aHasPrev)
+    {
+      myStatus = GeomFill_PlaneNotIntersectGuide;
+      aSeq.Append(gp_Pnt2d(t, myGuide->FirstParameter()));
+    }
+    else
+    {
+      aSeq.Append(gp_Pnt2d(t, aPrevW)); // keep the branch value; refined below
+    }
+  }
 
-    gp_Pnt2d p1(t, w); // on stocke les parametres
-    Pole->SetValue(1, ii, p1);
+  // cadrum fix C: refine adaptively until neighbouring samples differ by less than
+  // DeltaG in guide parameter, so evaluation-time seeds interpolate inside one
+  // branch. Bounded to keep degenerate inputs from exploding the table.
+  const int aMaxPts   = 20 * myNbPts;
+  bool      aInserted = true;
+  while (aInserted && aSeq.Length() < aMaxPts)
+  {
+    aInserted = false;
+    for (int ii = 1; ii < aSeq.Length() && aSeq.Length() < aMaxPts; ii++)
+    {
+      const gp_Pnt2d a1 = aSeq(ii);
+      const gp_Pnt2d a2 = aSeq(ii + 1);
+      if (std::abs(a2.Y() - a1.Y()) <= DeltaG || (a2.X() - a1.X()) < 1.e-9 * (l - f))
+        continue;
+      const double aTm = 0.5 * (a1.X() + a2.X());
+      double       aWm = 0.;
+      if (!aSolveAt(aTm, true, a1.Y(), aWm))
+        aWm = 0.5 * (a1.Y() + a2.Y());
+      aSeq.InsertAfter(ii, gp_Pnt2d(aTm, aWm));
+      aInserted = true;
+      ii++;
+    }
+  }
 
-  } // for_ii
+  Pole = new (NCollection_HArray2<gp_Pnt2d>)(1, 1, 1, aSeq.Length());
+  for (int ii = 1; ii <= aSeq.Length(); ii++)
+    Pole->SetValue(1, ii, aSeq(ii));
 }
 
 //=================================================================================================
@@ -232,11 +281,36 @@ bool GeomFill_GuideTrihedronPlan::D0(const double Param,
   GeomFill_PlanFunc E(P, Tangent, myGuide);
 
   // resolution
-  math_FunctionRoot Result(E, X(1), XTol(1), Inf(1), Sup(1), Iter);
-
-  if (Result.IsDone())
+  // cadrum fix C: polish the interpolated seed inside its own table bracket. The
+  // member bounds spanned twice the guide range and let the solver capture the
+  // antipodal branch of a closed guide. Should the local search fail, retry from
+  // the other periodic image of the seed; as a last resort keep the seed itself -
+  // the refined table already makes it accurate to within DeltaG.
+  double aGPeriod = 0.;
+  const bool   isGClosed = cadrumGuideClosed(myGuide, aGPeriod);
+  const double aPad      = 0.05 * aGPeriod;
+  math_FunctionRoot Result(E, X(1), XTol(1), std::min(myWLo, X(1)) - aPad, std::max(myWHi, X(1)) + aPad, Iter);
+  bool   aRootDone = Result.IsDone();
+  double aRootVal  = aRootDone ? Result.Root() : 0.;
+  if (!aRootDone && isGClosed)
   {
-    double Res = Result.Root();
+    const double aXAlt = (X(1) - myGuide->FirstParameter() > aGPeriod / 2.) ? X(1) - aGPeriod : X(1) + aGPeriod;
+    math_FunctionRoot ResultAlt(E, aXAlt, XTol(1), aXAlt - aPad, aXAlt + aPad, Iter);
+    if (ResultAlt.IsDone())
+    {
+      aRootDone = true;
+      aRootVal  = ResultAlt.Root();
+    }
+  }
+  if (!aRootDone)
+  {
+    aRootDone = true;
+    aRootVal  = X(1);
+  }
+
+  if (aRootDone)
+  {
+    double Res = aRootVal;
     //      R = Result.Root();    // solution
 
     Pprime = myTrimG->Value(Res); // pt sur courbe guide
@@ -289,11 +363,36 @@ bool GeomFill_GuideTrihedronPlan::D1(const double Param,
   GeomFill_PlanFunc E(P, Tangent, myGuide);
 
   // resolution
-  math_FunctionRoot Result(E, X(1), XTol(1), Inf(1), Sup(1), Iter);
-
-  if (Result.IsDone())
+  // cadrum fix C: polish the interpolated seed inside its own table bracket. The
+  // member bounds spanned twice the guide range and let the solver capture the
+  // antipodal branch of a closed guide. Should the local search fail, retry from
+  // the other periodic image of the seed; as a last resort keep the seed itself -
+  // the refined table already makes it accurate to within DeltaG.
+  double aGPeriod = 0.;
+  const bool   isGClosed = cadrumGuideClosed(myGuide, aGPeriod);
+  const double aPad      = 0.05 * aGPeriod;
+  math_FunctionRoot Result(E, X(1), XTol(1), std::min(myWLo, X(1)) - aPad, std::max(myWHi, X(1)) + aPad, Iter);
+  bool   aRootDone = Result.IsDone();
+  double aRootVal  = aRootDone ? Result.Root() : 0.;
+  if (!aRootDone && isGClosed)
   {
-    double Res = Result.Root();
+    const double aXAlt = (X(1) - myGuide->FirstParameter() > aGPeriod / 2.) ? X(1) - aGPeriod : X(1) + aGPeriod;
+    math_FunctionRoot ResultAlt(E, aXAlt, XTol(1), aXAlt - aPad, aXAlt + aPad, Iter);
+    if (ResultAlt.IsDone())
+    {
+      aRootDone = true;
+      aRootVal  = ResultAlt.Root();
+    }
+  }
+  if (!aRootDone)
+  {
+    aRootDone = true;
+    aRootVal  = X(1);
+  }
+
+  if (aRootDone)
+  {
+    double Res = aRootVal;
     //      R = Result.Root();    // solution
     myTrimG->D1(Res, PG, TG);
     gp_Vec n(P, PG), dn; // vecteur definissant la normale du triedre
@@ -575,8 +674,20 @@ void GeomFill_GuideTrihedronPlan::InitX(const double Param)
   {
     X(1) = (Pole->Value(1, Ideb).Coord(2) + Pole->Value(1, Ifin).Coord(2)) / 2;
   }
-  if (myGuide->IsPeriodic())
+  // cadrum fix C: remember the local bracket the seed was interpolated from, so the
+  // evaluation-time root search can be confined to it.
+  myWLo = std::min(Pole->Value(1, Ideb).Coord(2), Pole->Value(1, Ifin).Coord(2));
+  myWHi = std::max(Pole->Value(1, Ideb).Coord(2), Pole->Value(1, Ifin).Coord(2));
+
+  // Fold a seed interpolated past the seam of a closed guide back into the evaluable
+  // range (composite adaptors of a closed wire report IsPeriodic()=false while still
+  // wrapping at LastParameter); shift the bracket together with the seed.
+  double aGPeriod = 0.;
+  if (cadrumGuideClosed(myGuide, aGPeriod))
   {
-    X(1) = ElCLib::InPeriod(X(1), myGuide->FirstParameter(), myGuide->LastParameter());
+    const double aFolded = ElCLib::InPeriod(X(1), myGuide->FirstParameter(), myGuide->LastParameter());
+    myWLo += aFolded - X(1);
+    myWHi += aFolded - X(1);
+    X(1) = aFolded;
   }
 }
