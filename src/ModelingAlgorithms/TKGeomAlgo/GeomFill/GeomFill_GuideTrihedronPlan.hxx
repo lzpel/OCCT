@@ -126,6 +126,9 @@ private:
   math_Vector                                Sup;
   occ::handle<GeomFill_Frenet>               frenet;
   int                                        myNbPts;
+  // cadrum fix C: local bracket around the last interpolated seed (set by InitX)
+  double                                     myWLo = 0.0;
+  double                                     myWHi = 0.0;
   GeomFill_PipeError                         myStatus;
 };
 
