@@ -538,10 +538,8 @@ TEST(BRepFilletAPI_MakeFilletTest, OCC426_RevolveFuseUnifyFillet)
 
 //=================================================================================================
 
-// A 22.5 square whose left side bows out into an arc, extruded 5 along Z, filleted on the bottom
-// right straight edge and on the arc's top edge. The two stripes share no vertex and hold a
-// different number of surface data; PerformMoreSurfdata indexed the first stripe with an index
-// computed for the stripe at the vertex and the build crashed in ChFi3d_StripeEdgeInter.
+// Two fillets whose stripes share no vertex and hold a different number of surface data.
+// Bug: PerformMoreSurfdata indexed the first stripe with the vertex stripe's index and crashed.
 TEST(BRepFilletAPI_MakeFilletTest, DisjointStripesWithDifferentSurfDataCounts)
 {
   const gp_Pnt aP0(0.0, 0.0, 0.0), aP1(22.5, 0.0, 0.0), aP2(22.5, 22.5, 0.0), aP3(0.0, 22.5, 0.0);
