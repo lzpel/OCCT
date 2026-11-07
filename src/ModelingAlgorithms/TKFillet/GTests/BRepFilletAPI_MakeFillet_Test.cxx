@@ -538,47 +538,6 @@ TEST(BRepFilletAPI_MakeFilletTest, OCC426_RevolveFuseUnifyFillet)
 
 //=================================================================================================
 
-namespace
-{
-
-//! The edge of the shape nearest to the point.
-TopoDS_Edge nearestEdge(const TopoDS_Shape& theShape, const gp_Pnt& thePoint)
-{
-  TopoDS_Edge        aBest;
-  double             aBestDist = 1.e100;
-  const TopoDS_Shape aVertex   = BRepBuilderAPI_MakeVertex(thePoint).Shape();
-  for (TopExp_Explorer anExp(theShape, TopAbs_EDGE); anExp.More(); anExp.Next())
-  {
-    BRepExtrema_DistShapeShape aDist(aVertex, anExp.Current());
-    if (aDist.IsDone() && aDist.Value() < aBestDist)
-    {
-      aBestDist = aDist.Value();
-      aBest     = TopoDS::Edge(anExp.Current());
-    }
-  }
-  return aBest;
-}
-
-//! Volume of the shape.
-double volumeOf(const TopoDS_Shape& theShape)
-{
-  GProp_GProps aProps;
-  BRepGProp::VolumeProperties(theShape, aProps);
-  return aProps.Mass();
-}
-
-//! Volume removed by a fillet of the given radius on one edge, which must succeed.
-double removedByFillet(const TopoDS_Shape& theShape, double theRadius, const TopoDS_Edge& theEdge)
-{
-  BRepFilletAPI_MakeFillet aFillet(theShape);
-  aFillet.Add(theRadius, theEdge);
-  aFillet.Build();
-  EXPECT_TRUE(aFillet.IsDone());
-  return volumeOf(theShape) - volumeOf(aFillet.Shape());
-}
-
-} // anonymous namespace
-
 // A 22.5 square whose left side bows out into an arc, extruded 5 along Z, filleted on the bottom
 // right straight edge and on the arc's top edge. The two stripes share no vertex and hold a
 // different number of surface data; PerformMoreSurfdata indexed the first stripe with an index
@@ -595,10 +554,40 @@ TEST(BRepFilletAPI_MakeFilletTest, DisjointStripesWithDifferentSurfDataCounts)
   const TopoDS_Face  aFace  = BRepBuilderAPI_MakeFace(aWire.Wire()).Face();
   const TopoDS_Shape aPrism = BRepPrimAPI_MakePrism(aFace, gp_Vec(0.0, 0.0, 5.0)).Shape();
 
-  const TopoDS_Edge aStraight        = nearestEdge(aPrism, gp_Pnt(22.5, 11.25, 0.0));
-  const TopoDS_Edge anArc            = nearestEdge(aPrism, gp_Pnt(-7.5, 11.25, 5.0));
-  const double      aRemovedStraight = removedByFillet(aPrism, 2.5, aStraight);
-  const double      aRemovedArc      = removedByFillet(aPrism, 2.5, anArc);
+  const auto aNearestEdge = [&aPrism](const gp_Pnt& thePoint) {
+    TopoDS_Edge        aBest;
+    double             aBestDist = 1.e100;
+    const TopoDS_Shape aVertex   = BRepBuilderAPI_MakeVertex(thePoint).Shape();
+    for (TopExp_Explorer anExp(aPrism, TopAbs_EDGE); anExp.More(); anExp.Next())
+    {
+      BRepExtrema_DistShapeShape aDist(aVertex, anExp.Current());
+      if (aDist.IsDone() && aDist.Value() < aBestDist)
+      {
+        aBestDist = aDist.Value();
+        aBest     = TopoDS::Edge(anExp.Current());
+      }
+    }
+    return aBest;
+  };
+  const auto aVolume = [](const TopoDS_Shape& theShape) {
+    GProp_GProps aProps;
+    BRepGProp::VolumeProperties(theShape, aProps);
+    return aProps.Mass();
+  };
+  const TopoDS_Edge aStraight = aNearestEdge(gp_Pnt(22.5, 11.25, 0.0));
+  const TopoDS_Edge anArc     = aNearestEdge(gp_Pnt(-7.5, 11.25, 5.0));
+
+  // Each edge alone fillets fine; remember what each removes.
+  BRepFilletAPI_MakeFillet aStraightOnly(aPrism);
+  aStraightOnly.Add(2.5, aStraight);
+  aStraightOnly.Build();
+  ASSERT_TRUE(aStraightOnly.IsDone());
+  BRepFilletAPI_MakeFillet anArcOnly(aPrism);
+  anArcOnly.Add(2.5, anArc);
+  anArcOnly.Build();
+  ASSERT_TRUE(anArcOnly.IsDone());
+  const double aRemoved =
+    2.0 * aVolume(aPrism) - aVolume(aStraightOnly.Shape()) - aVolume(anArcOnly.Shape());
 
   BRepFilletAPI_MakeFillet aFillet(aPrism);
   aFillet.Add(2.5, aStraight);
@@ -606,5 +595,5 @@ TEST(BRepFilletAPI_MakeFilletTest, DisjointStripesWithDifferentSurfDataCounts)
   ASSERT_NO_THROW(aFillet.Build());
   ASSERT_TRUE(aFillet.IsDone());
   EXPECT_TRUE(BRepCheck_Analyzer(aFillet.Shape()).IsValid());
-  EXPECT_NEAR(volumeOf(aFillet.Shape()), volumeOf(aPrism) - aRemovedStraight - aRemovedArc, 1.e-3);
+  EXPECT_NEAR(aVolume(aFillet.Shape()), aVolume(aPrism) - aRemoved, 1.e-3);
 }
